@@ -1,3 +1,4 @@
+// --- fichier : servudp.c ---
 /*****
 * Exemple de serveur UDP
 * socket en mode non connecte
@@ -52,8 +53,13 @@ socklen_t ls;
       else {
         buf[n] = '\0';
         printf ("recu de %s : <%s>\n",addrip(ntohl(Sock.sin_addr.s_addr)), buf);
+        
+        // envoi de l'accuse de reception a l'expediteur
+        char *ar = "Bien reçu 5/5 !";
+        if (sendto(sid, ar, strlen(ar), 0, (struct sockaddr *)&Sock, ls) == -1) {
+            perror("sendto ar");
+        }
       }
     }
     return 0;
 }
-

@@ -1,3 +1,4 @@
+// --- fichier : cliudp.c ---
 /*****
 * Exemple de client UDP
 * socket en mode non connecte
@@ -40,12 +41,25 @@ struct sockaddr_in Sock;
     Sock.sin_family = AF_INET;
     bcopy(h->h_addr,&Sock.sin_addr,h->h_length);
     Sock.sin_port = htons(atoi(P[2]));
-    if (sendto(sid,P[3],strlen(P[3]),0,(struct sockaddr *)&Sock,
+    
+    // modification du flag 0 en msg_confirm
+    if (sendto(sid,P[3],strlen(P[3]),MSG_CONFIRM,(struct sockaddr *)&Sock,
                            sizeof(Sock))==-1) {
         perror("sendto");
         return(4);
     }
     printf("Envoi OK !\n");
+    
+    // attente et reception de l'accuse de reception
+    char buf_ar[512];
+    socklen_t ls = sizeof(Sock);
+    int n = recvfrom(sid, buf_ar, sizeof(buf_ar)-1, 0, (struct sockaddr *)&Sock, &ls);
+    if (n != -1) {
+        buf_ar[n] = '\0';
+        printf("ar recu du serveur : %s\n", buf_ar);
+    } else {
+        perror("recvfrom ar");
+    }
+    
     return 0;
 }
-
