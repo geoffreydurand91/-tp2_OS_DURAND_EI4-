@@ -1,16 +1,26 @@
-default : servudp cliudp servbeuip clibeuip
+CC = cc
+CFLAGS = -Wall -g
+LDFLAGS = -lreadline
 
-cliudp : cliudp.c
-	cc -Wall -o cliudp cliudp.c
+all: biceps servbeuip clibeuip
 
-servudp : servudp.c
-	cc -Wall -o servudp servudp.c
+# compilation de l'executable principal avec les deux librairies
+biceps: biceps.o gescom.o creme.o
+	$(CC) $(CFLAGS) -o biceps biceps.o gescom.o creme.o $(LDFLAGS)
 
-servbeuip : servbeuip.c
-	cc -Wall -o servbeuip servbeuip.c
+# serveurs et clients de test (utilisent aussi creme.o)
+servbeuip: servbeuip.o creme.o
+	$(CC) $(CFLAGS) -o servbeuip servbeuip.o creme.o
 
-clibeuip : clibeuip.c
-	cc -Wall -o clibeuip clibeuip.c
+clibeuip: clibeuip.o creme.o
+	$(CC) $(CFLAGS) -o clibeuip clibeuip.o creme.o
 
-clean :
-	rm -f cliudp servudp servbeuip clibeuip
+# regles generiques pour les fichiers objets
+%.o: %.c %.h
+	$(CC) $(CFLAGS) -c $<
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c $<
+
+clean:
+	rm -f *.o biceps servbeuip clibeuip
