@@ -18,25 +18,89 @@
 #define PORT 9998
 #define MAX_CLIENTS 255
 
-// structures et variables globales partagees pour le reseau beuip
 struct client {
     struct in_addr ip;
     char pseudo[256];
 };
 
+// variables globales partagees (memoire commune)
 struct client table[MAX_CLIENTS];
 int nb_clients = 0;
-
-// protection des variables globales pour le multi-threading
 pthread_mutex_t mutex_table = PTHREAD_MUTEX_INITIALIZER;
 int serveur_actif = 0;
 pthread_t thread_udp;
 char pseudo_local[256];
 char chemin_historique[1024];
 
-// fonction executee par le thread serveur udp
+// fonction centralisee pour les commandes internes beuip (etape 1.2)
+void commande(char octet1, char *message, char *pseudo) {
+    if (!serveur_actif) {
+        printf("erreur : le serveur beuip n'est pas demarre.\n");
+        return;
+    }
+
+    if (octet1 == '3') {
+        // lecture securisee de la table partagee
+        pthread_mutex_lock(&mutex_table);
+        printf("\n--- liste des contacts internes ---\n");
+        for (int i = 0; i < nb_clients; i++) {
+            printf("- %s (%s)\n", table[i].pseudo, inet_ntoa(table[i].ip));
+        }
+        printf("-----------------------------------\n\n");
+        pthread_mutex_unlock(&mutex_table);
+    } 
+    else if (octet1 == '4' || octet1 == '5' || octet1 == '0') {
+        // creation d'une socket d'emission temporaire
+        int sid_out = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (sid_out < 0) return;
+        
+        int opt = 1;
+        setsockopt(sid_out, SOL_SOCKET, SO_BROADCAST, &opt, sizeof(opt));
+        
+        char msg_out[512];
+        struct sockaddr_in Dest;
+        bzero(&Dest, sizeof(Dest));
+        Dest.sin_family = AF_INET;
+        Dest.sin_port = htons(PORT);
+
+        pthread_mutex_lock(&mutex_table);
+        
+        if (octet1 == '4' && pseudo != NULL && message != NULL) {
+            int trouve = 0;
+            for (int i = 0; i < nb_clients; i++) {
+                if (strcmp(table[i].pseudo, pseudo) == 0) {
+                    Dest.sin_addr = table[i].ip;
+                    sprintf(msg_out, "9BEUIP%s", message);
+                    sendto(sid_out, msg_out, 6 + strlen(message), 0, (struct sockaddr *)&Dest, sizeof(Dest));
+                    trouve = 1;
+                    break;
+                }
+            }
+            if (!trouve) printf("erreur : pseudo introuvable.\n");
+        } 
+        else if (octet1 == '5' && message != NULL) {
+            sprintf(msg_out, "9BEUIP%s", message);
+            for (int i = 0; i < nb_clients; i++) {
+                Dest.sin_addr = table[i].ip;
+                sendto(sid_out, msg_out, 6 + strlen(message), 0, (struct sockaddr *)&Dest, sizeof(Dest));
+            }
+        }
+        else if (octet1 == '0') {
+            // envoi du message de deconnexion a toute la liste
+            sprintf(msg_out, "0BEUIP%s", pseudo_local);
+            for (int i = 0; i < nb_clients; i++) {
+                Dest.sin_addr = table[i].ip;
+                sendto(sid_out, msg_out, strlen(msg_out), 0, (struct sockaddr *)&Dest, sizeof(Dest));
+            }
+        }
+        
+        pthread_mutex_unlock(&mutex_table);
+        close(sid_out);
+    }
+}
+
+// thread du serveur udp (ne gere plus que 0, 1, 2, 9)
 void *serveur_udp(void *p) {
-    char *pseudo = (char *)p;
     int sid, n;
     struct sockaddr_in SockConf, Sock, Bcast;
     socklen_t ls;
@@ -45,10 +109,7 @@ void *serveur_udp(void *p) {
     fd_set readfds;
     struct timeval tv;
 
-    if ((sid = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) < 0) {
-        perror("socket udp");
-        pthread_exit(NULL);
-    }
+    if ((sid = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) < 0) pthread_exit(NULL);
 
     bzero(&SockConf, sizeof(SockConf));
     SockConf.sin_family = AF_INET;
@@ -56,7 +117,6 @@ void *serveur_udp(void *p) {
     SockConf.sin_addr.s_addr = htonl(INADDR_ANY);
 
     if (bind(sid, (struct sockaddr *)&SockConf, sizeof(SockConf)) == -1) {
-        perror("bind udp");
         close(sid);
         pthread_exit(NULL);
     }
@@ -67,34 +127,28 @@ void *serveur_udp(void *p) {
     bzero(&Bcast, sizeof(Bcast));
     Bcast.sin_family = AF_INET;
     Bcast.sin_port = htons(PORT);
-    // adresse en dur temporaire, sera modifiee a l'etape 2
     Bcast.sin_addr.s_addr = inet_addr("192.168.88.255");
     
-    sprintf(msg_out, "1BEUIP%s", pseudo);
-    // on ignore l'erreur si le mac n'est pas connecte au bon reseau pour le test
+    sprintf(msg_out, "1BEUIP%s", pseudo_local);
     sendto(sid, msg_out, strlen(msg_out), 0, (struct sockaddr *)&Bcast, sizeof(Bcast));
-    printf("\n[thread réseau] serveur udp lance et annonce envoyee.\n");
+    printf("\n[thread réseau] serveur udp lance sur le port %d.\n", PORT);
 
     while (serveur_actif) {
         FD_ZERO(&readfds);
         FD_SET(sid, &readfds);
         tv.tv_sec = 0;
-        tv.tv_usec = 200000; // timeout de 200ms pour verifier serveur_actif regulierement
+        tv.tv_usec = 200000;
 
-        int retval = select(sid + 1, &readfds, NULL, NULL, &tv);
-        if (retval > 0 && FD_ISSET(sid, &readfds)) {
+        if (select(sid + 1, &readfds, NULL, NULL, &tv) > 0 && FD_ISSET(sid, &readfds)) {
             ls = sizeof(Sock);
             n = recvfrom(sid, buf, sizeof(buf) - 1, 0, (struct sockaddr *)&Sock, &ls);
             if (n > 0) {
                 buf[n] = '\0';
-                // verification stricte : presence du beuip
                 if (n >= 6 && strncmp(buf + 1, "BEUIP", 5) == 0) {
                     char code = buf[0];
                     char *donnees = buf + 6;
                     
-                    // le serveur udp ne gere plus que les codes 0, 1, 2 et 9 (sujet 1.2)
                     if (code == '1' || code == '2') {
-                        // verrouillage avant modification de la table
                         pthread_mutex_lock(&mutex_table);
                         int existe = 0;
                         for (int i = 0; i < nb_clients; i++) {
@@ -107,12 +161,12 @@ void *serveur_udp(void *p) {
                             table[nb_clients].ip = Sock.sin_addr;
                             strncpy(table[nb_clients].pseudo, donnees, 255);
                             nb_clients++;
-                            printf("\n[thread réseau] nouveau contact : %s (%s)\n", donnees, inet_ntoa(Sock.sin_addr));
+                            printf("\n[thread réseau] nouveau contact : %s\n", donnees);
                         }
                         pthread_mutex_unlock(&mutex_table);
                         
                         if (code == '1') {
-                            sprintf(msg_out, "2BEUIP%s", pseudo);
+                            sprintf(msg_out, "2BEUIP%s", pseudo_local);
                             sendto(sid, msg_out, strlen(msg_out), 0, (struct sockaddr *)&Sock, ls);
                         }
                     } else if (code == '9') {
@@ -126,12 +180,12 @@ void *serveur_udp(void *p) {
                             }
                         }
                         pthread_mutex_unlock(&mutex_table);
-                        if (!trouve) printf("\n[message d'inconnu (%s)] : %s\n", inet_ntoa(Sock.sin_addr), donnees);
+                        if (!trouve) printf("\n[message d'inconnu] : %s\n", donnees);
                     } else if (code == '0') {
                         pthread_mutex_lock(&mutex_table);
                         for (int i = 0; i < nb_clients; i++) {
                             if (table[i].ip.s_addr == Sock.sin_addr.s_addr) {
-                                printf("\n[thread réseau] le contact %s a quitte.\n", table[i].pseudo);
+                                printf("\n[thread réseau] %s a quitte le reseau.\n", table[i].pseudo);
                                 for (int j = i; j < nb_clients - 1; j++) {
                                     table[j] = table[j+1];
                                 }
@@ -141,7 +195,7 @@ void *serveur_udp(void *p) {
                         }
                         pthread_mutex_unlock(&mutex_table);
                     } else {
-                        printf("\n[thread réseau] erreur : tentative de piratage avec code %c rejete.\n", code);
+                        printf("\n[thread réseau] alerte : tentative de piratage bloquee (code %c).\n", code);
                     }
                 }
             }
@@ -151,24 +205,38 @@ void *serveur_udp(void *p) {
     pthread_exit(NULL);
 }
 
-// fonction implementant la commande beuip start
+// parsage de la commande interne beuip
 int cmd_beuip(int n, char *p[]) {
     if (n >= 3 && strcmp(p[1], "start") == 0) {
         if (serveur_actif) {
-            printf("erreur : le serveur udp tourne deja.\n");
+            printf("erreur : serveur deja actif.\n");
             return 1;
         }
         strncpy(pseudo_local, p[2], sizeof(pseudo_local)-1);
-        serveur_actif = 1; // drapeau pour la boucle du thread
-        
-        // creation et lancement du thread posix
-        if (pthread_create(&thread_udp, NULL, serveur_udp, pseudo_local) != 0) {
-            perror("erreur lancement thread");
-            serveur_actif = 0;
-            return 2;
+        serveur_actif = 1;
+        pthread_create(&thread_udp, NULL, serveur_udp, NULL);
+    } 
+    else if (n == 2 && strcmp(p[1], "stop") == 0) {
+        if (serveur_actif) {
+            commande('0', NULL, NULL); // envoi du signal de deconnexion
+            serveur_actif = 0;         // casse la boucle du thread
+            pthread_join(thread_udp, NULL); // attend la fermeture propre
+            printf("serveur beuip arrete.\n");
+        } else {
+            printf("aucun serveur actif.\n");
         }
-    } else {
-        printf("utilisation : beuip start pseudo\n");
+    }
+    else if (n == 2 && strcmp(p[1], "liste") == 0) {
+        commande('3', NULL, NULL);
+    }
+    else if (n == 4 && strcmp(p[1], "mp") == 0) {
+        commande('4', p[3], p[2]);
+    }
+    else if (n == 3 && strcmp(p[1], "all") == 0) {
+        commande('5', p[2], NULL);
+    }
+    else {
+        printf("utilisation : beuip [start pseudo | stop | liste | mp pseudo msg | all msg]\n");
     }
     return 0;
 }
@@ -182,6 +250,11 @@ int est_ligne_utile(const char *ligne) {
 }
 
 int Sortie(int N, char *P[]) {
+    if (serveur_actif) {
+        commande('0', NULL, NULL);
+        serveur_actif = 0;
+        pthread_join(thread_udp, NULL);
+    }
     libererMots();
     write_history(chemin_historique);
     printf("sortie correcte du programme biceps.\n");
@@ -190,26 +263,14 @@ int Sortie(int N, char *P[]) {
 }
 
 int change_dir(int n, char *p[]) {
-    if (n > 1) {
-        if (chdir(p[1]) != 0) perror("erreur cd");
-    } else {
-        chdir(getenv("HOME"));
-    }
+    if (n > 1) chdir(p[1]);
+    else chdir(getenv("HOME"));
     return 0;
 }
 
 int print_wd(int n, char *p[]) {
     char cwd[1024];
-    if (getcwd(cwd, sizeof(cwd)) != NULL) {
-        printf("%s\n", cwd);
-    } else {
-        perror("erreur pwd");
-    }
-    return 0;
-}
-
-int version(int n, char *p[]) {
-    printf("biceps version 3.0\n");
+    if (getcwd(cwd, sizeof(cwd)) != NULL) printf("%s\n", cwd);
     return 0;
 }
 
@@ -217,17 +278,11 @@ void majComInt(void) {
     ajouteCom("exit", Sortie);
     ajouteCom("cd", change_dir);
     ajouteCom("pwd", print_wd);
-    ajouteCom("vers", version);
-    // ajout de la nouvelle commande beuip
     ajouteCom("beuip", cmd_beuip);
 }
 
 int main(void) {
-    char nom_machine[256];
-    char *nom_utilisateur;
-    char prompt[512];
-    char *ligne_saisie;
-    char caractere_fin;
+    char nom_machine[256], *nom_utilisateur, prompt[512], *ligne_saisie, caractere_fin;
 
     signal(SIGINT, SIG_IGN);
     majComInt();
@@ -241,17 +296,18 @@ int main(void) {
     read_history(chemin_historique);
 
     while (1) {
-        char cwd[1024];
-        char chemin_affiche[1024] = "";
-        
-        if (getcwd(cwd, sizeof(cwd)) != NULL) {
-            snprintf(chemin_affiche, sizeof(chemin_affiche), " [%s]", cwd);
-        }
+        char cwd[1024], chemin_affiche[1024] = "";
+        if (getcwd(cwd, sizeof(cwd)) != NULL) snprintf(chemin_affiche, sizeof(chemin_affiche), " [%s]", cwd);
         snprintf(prompt, sizeof(prompt), "%s@%s%s%c ", nom_utilisateur, nom_machine, chemin_affiche, caractere_fin);
 
         ligne_saisie = readline(prompt);
         if (ligne_saisie == NULL) {
-            printf("\nsortie correcte du programme biceps.\n");
+            if (serveur_actif) {
+                commande('0', NULL, NULL);
+                serveur_actif = 0;
+                pthread_join(thread_udp, NULL);
+            }
+            printf("\nsortie correcte.\n");
             write_history(chemin_historique);
             break;
         }
@@ -262,7 +318,6 @@ int main(void) {
         }
         free(ligne_saisie);
     }
-    
     libererMots();
     return 0;
 }
