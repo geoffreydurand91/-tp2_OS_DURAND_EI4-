@@ -13,6 +13,7 @@
 #include <netdb.h>
 #include <pthread.h>
 #include <sys/select.h>
+#include <ifaddrs.h>
 #include "gescom.h" 
 
 #define PORT 9998
@@ -32,7 +33,7 @@ pthread_t thread_udp;
 char pseudo_local[256];
 char chemin_historique[1024];
 
-// fonction centralisee pour les commandes internes beuip (etape 1.2)
+// fonction centralisee pour les commandes internes beuip
 void commande(char octet1, char *message, char *pseudo) {
     if (!serveur_actif) {
         printf("erreur : le serveur beuip n'est pas demarre.\n");
@@ -40,7 +41,6 @@ void commande(char octet1, char *message, char *pseudo) {
     }
 
     if (octet1 == '3') {
-        // lecture securisee de la table partagee
         pthread_mutex_lock(&mutex_table);
         printf("\n--- liste des contacts internes ---\n");
         for (int i = 0; i < nb_clients; i++) {
@@ -50,7 +50,6 @@ void commande(char octet1, char *message, char *pseudo) {
         pthread_mutex_unlock(&mutex_table);
     } 
     else if (octet1 == '4' || octet1 == '5' || octet1 == '0') {
-        // creation d'une socket d'emission temporaire
         int sid_out = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (sid_out < 0) return;
         
@@ -86,7 +85,6 @@ void commande(char octet1, char *message, char *pseudo) {
             }
         }
         else if (octet1 == '0') {
-            // envoi du message de deconnexion a toute la liste
             sprintf(msg_out, "0BEUIP%s", pseudo_local);
             for (int i = 0; i < nb_clients; i++) {
                 Dest.sin_addr = table[i].ip;
@@ -99,17 +97,24 @@ void commande(char octet1, char *message, char *pseudo) {
     }
 }
 
-// thread du serveur udp (ne gere plus que 0, 1, 2, 9)
+// thread du serveur udp avec detection reseau automatique (etape 2.1)
 void *serveur_udp(void *p) {
     int sid, n;
-    struct sockaddr_in SockConf, Sock, Bcast;
+    struct sockaddr_in SockConf, Sock;
     socklen_t ls;
     char buf[512];
     char msg_out[512];
     fd_set readfds;
     struct timeval tv;
+    struct ifaddrs *ifaddr, *ifa;
+    char host[NI_MAXHOST];
 
     if ((sid = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) < 0) pthread_exit(NULL);
+
+    int opt = 1;
+    // ajout de so_reuseport pour permettre les tests locaux avec plusieurs terminaux
+    setsockopt(sid, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+    setsockopt(sid, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
     bzero(&SockConf, sizeof(SockConf));
     SockConf.sin_family = AF_INET;
@@ -117,22 +122,37 @@ void *serveur_udp(void *p) {
     SockConf.sin_addr.s_addr = htonl(INADDR_ANY);
 
     if (bind(sid, (struct sockaddr *)&SockConf, sizeof(SockConf)) == -1) {
+        perror("erreur bind serveur udp");
         close(sid);
         pthread_exit(NULL);
     }
 
-    int opt = 1;
     setsockopt(sid, SOL_SOCKET, SO_BROADCAST, &opt, sizeof(opt));
 
-    bzero(&Bcast, sizeof(Bcast));
-    Bcast.sin_family = AF_INET;
-    Bcast.sin_port = htons(PORT);
-    Bcast.sin_addr.s_addr = inet_addr("192.168.88.255");
-    
-    sprintf(msg_out, "1BEUIP%s", pseudo_local);
-    sendto(sid, msg_out, strlen(msg_out), 0, (struct sockaddr *)&Bcast, sizeof(Bcast));
     printf("\n[thread réseau] serveur udp lance sur le port %d.\n", PORT);
 
+    sprintf(msg_out, "1BEUIP%s", pseudo_local);
+
+    // recuperation et parcours des interfaces reseau
+    if (getifaddrs(&ifaddr) != -1) {
+        for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+            if (ifa->ifa_addr == NULL || ifa->ifa_broadaddr == NULL) continue;
+
+            if (ifa->ifa_addr->sa_family == AF_INET) {
+                int s = getnameinfo(ifa->ifa_broadaddr, sizeof(struct sockaddr_in), host, NI_MAXHOST, NULL, 0, NI_NUMERICHOST);
+                
+                if (s == 0 && strcmp(host, "127.0.0.1") != 0 && strcmp(host, "255.0.0.0") != 0) {
+                    struct sockaddr_in *bcast_addr = (struct sockaddr_in *)ifa->ifa_broadaddr;
+                    bcast_addr->sin_port = htons(PORT);
+                    sendto(sid, msg_out, strlen(msg_out), 0, (struct sockaddr *)bcast_addr, sizeof(struct sockaddr_in));
+                    printf("[thread réseau] annonce broadcast envoyee sur %s (%s)\n", ifa->ifa_name, host);
+                }
+            }
+        }
+        freeifaddrs(ifaddr);
+    }
+
+    // boucle principale du serveur
     while (serveur_actif) {
         FD_ZERO(&readfds);
         FD_SET(sid, &readfds);
@@ -161,13 +181,14 @@ void *serveur_udp(void *p) {
                             table[nb_clients].ip = Sock.sin_addr;
                             strncpy(table[nb_clients].pseudo, donnees, 255);
                             nb_clients++;
-                            printf("\n[thread réseau] nouveau contact : %s\n", donnees);
+                            printf("\n[thread réseau] nouveau contact : %s (%s)\n", donnees, inet_ntoa(Sock.sin_addr));
                         }
                         pthread_mutex_unlock(&mutex_table);
                         
                         if (code == '1') {
-                            sprintf(msg_out, "2BEUIP%s", pseudo_local);
-                            sendto(sid, msg_out, strlen(msg_out), 0, (struct sockaddr *)&Sock, ls);
+                            char msg_rep[512];
+                            sprintf(msg_rep, "2BEUIP%s", pseudo_local);
+                            sendto(sid, msg_rep, strlen(msg_rep), 0, (struct sockaddr *)&Sock, ls);
                         }
                     } else if (code == '9') {
                         pthread_mutex_lock(&mutex_table);
@@ -218,9 +239,9 @@ int cmd_beuip(int n, char *p[]) {
     } 
     else if (n == 2 && strcmp(p[1], "stop") == 0) {
         if (serveur_actif) {
-            commande('0', NULL, NULL); // envoi du signal de deconnexion
-            serveur_actif = 0;         // casse la boucle du thread
-            pthread_join(thread_udp, NULL); // attend la fermeture propre
+            commande('0', NULL, NULL); 
+            serveur_actif = 0;         
+            pthread_join(thread_udp, NULL); 
             printf("serveur beuip arrete.\n");
         } else {
             printf("aucun serveur actif.\n");
